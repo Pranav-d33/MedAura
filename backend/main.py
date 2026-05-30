@@ -27,7 +27,10 @@ from routes.event_routes import router as event_router
 from routes.data_routes import router as data_router
 from routes.observability_routes import router as observability_router
 from routes.upload_routes import router as upload_router
-from routes.voice_routes import router as voice_router
+try:
+    from routes.voice_routes import router as voice_router
+except ImportError:
+    voice_router = None
 
 
 # Try Pinecone first, fallback to ChromaDB, then SQL-only
@@ -146,7 +149,8 @@ app.include_router(event_router)
 app.include_router(data_router)
 app.include_router(observability_router)
 app.include_router(upload_router)
-app.include_router(voice_router)
+if voice_router:
+    app.include_router(voice_router)
 
 
 @app.get("/")

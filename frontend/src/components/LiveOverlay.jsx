@@ -48,6 +48,7 @@ export default function LiveOverlay({
     activeLanguage,
     onSelectLanguage,
     isAnyModalOpen,
+    onStopListening,
     onRetryListening,
     onOpenStartWithPrescription,
     onOpenAddPrescription,
@@ -387,7 +388,10 @@ export default function LiveOverlay({
                 </div>
 
                 {/* VOICE-REACTIVE SIRI SPHERE */}
-                <div className="pointer-events-auto mb-16 relative">
+                <div
+                    className={`pointer-events-auto mb-16 relative ${isListening ? 'cursor-pointer' : ''}`}
+                    onClick={() => { if (isListening && onStopListening) onStopListening(); }}
+                >
                     {/* Exit Button */}
                     <div className="mt-8 flex items-center justify-center gap-4 animate-slide-up relative z-20" style={{ animationDelay: '0.2s', animationFillMode: 'both' }}>
                         <button
@@ -466,6 +470,12 @@ export default function LiveOverlay({
                                 }}
                             ></div>
                         </div>
+                    )}
+
+                    {isListening && (
+                        <p className="text-center mt-2 text-[11px] font-brand font-semibold text-gray-400 tracking-wide animate-fade-in">
+                            Tap sphere to stop
+                        </p>
                     )}
 
                     <p className="text-center mt-4 font-medium text-gray-500">
