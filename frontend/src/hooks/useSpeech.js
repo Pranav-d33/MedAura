@@ -25,8 +25,8 @@ const ARABIC_LATIN_HINTS = /\b(salam|marhaba|shukran|yalla|tamam|aywa)\b/i;
 const HINGLISH_HINTS = /\b(mujhe|chahiye|karo|dena|wala|haan|nahi|kitna|dawai|tablet|pehla|dusra|aur|bhi|hai|ke liye|manga|ruko|band)\b/i;
 const ENGLISH_HINTS = /\b(the|and|please|need|add|medicine|medicines|cart|order|have|want|for|to|my)\b/i;
 
-const SILENCE_THRESHOLD = 0.04;
-const SILENCE_TIMEOUT_MS = 1500;
+const SILENCE_THRESHOLD = 0.03;
+const SILENCE_TIMEOUT_MS = 1000;
 
 function normalizeLanguageTag(lang) {
   if (!lang) return '';

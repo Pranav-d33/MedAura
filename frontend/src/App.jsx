@@ -1505,6 +1505,7 @@ export default function App() {
                 onSelectLanguage={handleLanguageSelect}
                 isAnyModalOpen={isAnyModalOpen}
                 onRetryListening={startListening}
+                onStopListening={stopListening}
                 onOpenStartWithPrescription={openStartWithPrescription}
                 onOpenAddPrescription={openAddPrescription}
                 onSelectCandidate={(med) => {
