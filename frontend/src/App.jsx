@@ -251,6 +251,8 @@ export default function App() {
         selectedVoice,
         setVoice,
         setPreferredLanguage,
+        enableVAD,
+        disableVAD,
     } = useSpeech();
     const messagesEndRef = useRef(null);
     const cameraInputRef = useRef(null);
@@ -444,14 +446,14 @@ export default function App() {
     // Voice mode stall recovery: auto-restart listening when idle
     // Quick restart (500ms) when no transcript (e.g. no-speech), slower (5s) safety net
     useEffect(() => {
-        if (!liveMode || isListening || isSpeaking || isLoading || shouldPauseVoiceCapture) return;
+        if (!liveMode || isListening || isSpeaking || isTranscribing || isLoading || shouldPauseVoiceCapture) return;
         const delay = transcript ? 5000 : 500;
         const timer = setTimeout(() => {
             console.warn('[VoiceMode] Stall detected — auto-restarting listening');
             startListening();
         }, delay);
         return () => clearTimeout(timer);
-    }, [liveMode, isListening, isSpeaking, isLoading, shouldPauseVoiceCapture, transcript, startListening]);
+    }, [liveMode, isListening, isSpeaking, isTranscribing, isLoading, shouldPauseVoiceCapture, transcript, startListening]);
 
     // Keep short-command detector in sync with latest transcript.
     useEffect(() => {
@@ -499,9 +501,10 @@ export default function App() {
     const toggleLiveMode = () => {
         if (liveMode) {
             setLiveMode(false); stopListening(); stopSpeaking();
+            disableVAD();
             pendingTranscriptQueueRef.current = [];
         } else {
-            setLiveMode(true); startListening();
+            setLiveMode(true); enableVAD(); startListening();
         }
     };
 
@@ -800,7 +803,7 @@ export default function App() {
         }
     }, [isLoading, handleSend]);
     useEffect(() => {
-        if (transcript && !isListening && !isSpeaking) {
+        if (transcript && !isListening && !isSpeaking && !isTranscribing) {
             if (isLoading) {
                 // Queue transcripts while processing so we don't drop rapid utterances.
                 pendingTranscriptQueueRef.current.push(transcript);
@@ -813,7 +816,7 @@ export default function App() {
                 setTranscript('');
             }
         }
-    }, [isListening, isSpeaking, transcript, isLoading, handleSend, setTranscript]);
+    }, [isListening, isSpeaking, isTranscribing, transcript, isLoading, handleSend, setTranscript]);
 
     // Process queued voice transcript when loading finishes
     useEffect(() => {
