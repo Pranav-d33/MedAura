@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import { MicVAD } from '@ricky0123/vad-web';
 
 const API_BASE = '/api';
 
@@ -24,9 +25,6 @@ const GERMAN_HINTS = /\b(und|ich|nicht|bitte|danke|für|mit|der|die|das|ein|eine
 const ARABIC_LATIN_HINTS = /\b(salam|marhaba|shukran|yalla|tamam|aywa)\b/i;
 const HINGLISH_HINTS = /\b(mujhe|chahiye|karo|dena|wala|haan|nahi|kitna|dawai|tablet|pehla|dusra|aur|bhi|hai|ke liye|manga|ruko|band)\b/i;
 const ENGLISH_HINTS = /\b(the|and|please|need|add|medicine|medicines|cart|order|have|want|for|to|my)\b/i;
-
-const SILENCE_THRESHOLD = 0.03;
-const SILENCE_TIMEOUT_MS = 1000;
 
 function normalizeLanguageTag(lang) {
   if (!lang) return '';
@@ -93,6 +91,7 @@ export function useSpeech() {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [userSpeaking, setUserSpeaking] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [error, setError] = useState(null);
   const [isSupported, setIsSupported] = useState(true);
@@ -107,9 +106,7 @@ export function useSpeech() {
   const audioChunksRef = useRef([]);
   const streamRef = useRef(null);
 
-  const audioContextRef = useRef(null);
-  const analyserRef = useRef(null);
-  const animationFrameRef = useRef(null);
+  const sileroVADRef = useRef(null);
 
   const audioPlayerRef = useRef(null);
   const audioOnEndRef = useRef(null);
@@ -117,7 +114,6 @@ export function useSpeech() {
   const langRef = useRef({ detected: detectedLanguage, manual: null, initial: initialLanguage });
   const lastDetectionRef = useRef({ ...LATIN_RESULT, lang: initialLanguage });
 
-  const silenceStartRef = useRef(null);
   const autoStopVADRef = useRef(false);
 
   useEffect(() => {
@@ -136,56 +132,43 @@ export function useSpeech() {
       .catch(() => {});
   }, []);
 
-  const startAudioAnalysis = useCallback((stream) => {
-    if (!stream) return;
-    try {
-      const audioContext = new AudioContext();
-      audioContextRef.current = audioContext;
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.8;
-      analyserRef.current = analyser;
-      const source = audioContext.createMediaStreamSource(stream);
-      source.connect(analyser);
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      const updateLevel = () => {
-        if (!analyserRef.current) return;
-        analyserRef.current.getByteFrequencyData(dataArray);
-        const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-        const normalized = Math.min(average / 128, 1);
-        setAudioLevel(normalized);
-        if (autoStopVADRef.current && mediaRecorderRef.current?.state === 'recording') {
-          if (normalized < SILENCE_THRESHOLD) {
-            const now = Date.now();
-            if (!silenceStartRef.current) silenceStartRef.current = now;
-            if (now - silenceStartRef.current > SILENCE_TIMEOUT_MS) {
-              silenceStartRef.current = null;
-              try { mediaRecorderRef.current.stop(); } catch (_) {}
-            }
-          } else {
-            silenceStartRef.current = null;
-          }
-        }
-        animationFrameRef.current = requestAnimationFrame(updateLevel);
-      };
-      updateLevel();
-    } catch (err) {
-      console.error('Audio analysis error:', err);
+  const destroySileroVAD = useCallback(() => {
+    if (sileroVADRef.current) {
+      sileroVADRef.current.destroy().catch(() => {});
+      sileroVADRef.current = null;
     }
+    setAudioLevel(0);
+    setUserSpeaking(false);
   }, []);
 
-  const stopAudioAnalysis = useCallback(() => {
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(() => {});
-      audioContextRef.current = null;
-    }
-    analyserRef.current = null;
-    setAudioLevel(0);
-    silenceStartRef.current = null;
+  const startSileroVAD = useCallback((stream) => {
+    if (!stream) return;
+    const opts = {
+      getStream: async () => stream,
+      redemptionMs: 900,
+      preSpeechPadMs: 200,
+      minSpeechMs: 400,
+      positiveSpeechThreshold: 0.7,
+      negativeSpeechThreshold: 0.3,
+      processorType: 'AudioWorklet',
+      startOnLoad: true,
+      onSpeechStart: () => {
+        setUserSpeaking(true);
+      },
+      onSpeechEnd: () => {
+        setUserSpeaking(false);
+        if (autoStopVADRef.current && mediaRecorderRef.current?.state === 'recording') {
+          try { mediaRecorderRef.current.stop(); } catch (_) {}
+        }
+      },
+      onFrameProcessed: (probs) => {
+        setAudioLevel(Math.min(1, probs.isSpeech * 2.5));
+      },
+      onVADMisfire: () => {},
+    };
+    MicVAD.new(opts)
+      .then(vad => { sileroVADRef.current = vad; })
+      .catch(err => console.error('Silero VAD init error:', err));
   }, []);
 
   const setPreferredLanguage = useCallback((langCode) => {
@@ -253,7 +236,7 @@ export function useSpeech() {
     navigator.mediaDevices.getUserMedia({ audio: true })
       .then((stream) => {
         streamRef.current = stream;
-        startAudioAnalysis(stream);
+        startSileroVAD(stream);
 
         const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
           ? 'audio/webm;codecs=opus'
@@ -265,6 +248,7 @@ export function useSpeech() {
         };
         recorder.onstop = () => {
           setIsListening(false);
+          destroySileroVAD();
           const blob = new Blob(audioChunksRef.current, { type: mimeType });
           audioChunksRef.current = [];
           if (blob.size > 0) sendAudioForTranscription(blob);
@@ -284,20 +268,19 @@ export function useSpeech() {
       .catch(() => {
         setError('Microphone access denied');
         setIsSupported(false);
-        stopAudioAnalysis();
+        destroySileroVAD();
       });
-  }, [startAudioAnalysis, sendAudioForTranscription]);
+  }, [startSileroVAD, sendAudioForTranscription]);
 
   const stopListening = useCallback(() => {
     autoStopVADRef.current = false;
-    silenceStartRef.current = null;
+    destroySileroVAD();
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
     } else {
       setIsListening(false);
-      stopAudioAnalysis();
     }
-  }, [stopAudioAnalysis]);
+  }, [destroySileroVAD]);
 
   const toggleListening = useCallback(() => {
     if (mediaRecorderRef.current?.state === 'recording') {
@@ -380,7 +363,6 @@ export function useSpeech() {
 
   const disableVAD = useCallback(() => {
     autoStopVADRef.current = false;
-    silenceStartRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -394,14 +376,15 @@ export function useSpeech() {
       if (audioPlayerRef.current) {
         audioPlayerRef.current.pause();
       }
-      stopAudioAnalysis();
+      destroySileroVAD();
     };
-  }, [stopAudioAnalysis]);
+  }, [destroySileroVAD]);
 
   return {
     isListening,
     isSpeaking,
     isTranscribing,
+    userSpeaking,
     transcript,
     error,
     isSupported,
