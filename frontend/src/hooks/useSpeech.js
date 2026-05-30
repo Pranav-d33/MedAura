@@ -1,526 +1,425 @@
-/**
- * Custom hook for Web Speech API (STT/TTS) with Audio Analysis
- * Auto-detects language and displays native scripts (Hindi, Tamil, etc.)
- *
- * v2 ??? Hardened for voice-mode reliability:
- *   ??? Recognition instance persisted via useRef (no re-creation on lang change)
- *   ??? TTS watchdog timer kills hung utterances after 30 s
- *   ??? Automatic recovery when voice loop stalls
- *   ??? Chrome speechSynthesis.resume() heartbeat to prevent queue freeze
- */
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+
+const API_BASE = '/api';
 
 const PRIORITY_LANGS = ['en-US', 'de-DE', 'ar-SA', 'hi-IN'];
 const BONUS_LANGS = ['ta-IN', 'te-IN', 'bn-IN', 'gu-IN', 'kn-IN', 'ml-IN', 'pa-IN', 'or-IN'];
 
-// TTS watchdog: max seconds before we forcibly cancel a stuck utterance
-const TTS_MAX_DURATION_MS = 30_000;
-// Chrome heartbeat interval to keep speechSynthesis alive
-const TTS_HEARTBEAT_MS = 5_000;
-
-// Precompiled regex patterns for faster script detection
 const SCRIPT_PATTERNS = [
-    { regex: /[\u0900-\u097F]/, lang: 'hi-IN', script: 'Devanagari' },
-    { regex: /[\u0B80-\u0BFF]/, lang: 'ta-IN', script: 'Tamil' },
-    { regex: /[\u0C00-\u0C7F]/, lang: 'te-IN', script: 'Telugu' },
-    { regex: /[\u0980-\u09FF]/, lang: 'bn-IN', script: 'Bengali' },
-    { regex: /[\u0A80-\u0AFF]/, lang: 'gu-IN', script: 'Gujarati' },
-    { regex: /[\u0C80-\u0CFF]/, lang: 'kn-IN', script: 'Kannada' },
-    { regex: /[\u0D00-\u0D7F]/, lang: 'ml-IN', script: 'Malayalam' },
-    { regex: /[\u0A00-\u0A7F]/, lang: 'pa-IN', script: 'Gurmukhi' },
-    { regex: /[\u0B00-\u0B7F]/, lang: 'or-IN', script: 'Odia' },
-    { regex: /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/, lang: 'ar-SA', script: 'Arabic' },
+  { regex: /[\u0900-\u097F]/, lang: 'hi-IN', script: 'Devanagari' },
+  { regex: /[\u0B80-\u0BFF]/, lang: 'ta-IN', script: 'Tamil' },
+  { regex: /[\u0C00-\u0C7F]/, lang: 'te-IN', script: 'Telugu' },
+  { regex: /[\u0980-\u09FF]/, lang: 'bn-IN', script: 'Bengali' },
+  { regex: /[\u0A80-\u0AFF]/, lang: 'gu-IN', script: 'Gujarati' },
+  { regex: /[\u0C80-\u0CFF]/, lang: 'kn-IN', script: 'Kannada' },
+  { regex: /[\u0D00-\u0D7F]/, lang: 'ml-IN', script: 'Malayalam' },
+  { regex: /[\u0A00-\u0A7F]/, lang: 'pa-IN', script: 'Gurmukhi' },
+  { regex: /[\u0B00-\u0B7F]/, lang: 'or-IN', script: 'Odia' },
+  { regex: /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/, lang: 'ar-SA', script: 'Arabic' },
 ];
 
 const LATIN_RESULT = { lang: 'en-US', script: 'Latin', direction: 'ltr' };
 
-const GERMAN_HINTS = /\b(und|ich|nicht|bitte|danke|f??r|mit|der|die|das|ein|eine|habe|haben|brauche|m??chte|medizin|tabletten|bestellen|warenkorb|kasse|ja|nein)\b/i;
+const GERMAN_HINTS = /\b(und|ich|nicht|bitte|danke|für|mit|der|die|das|ein|eine|habe|haben|brauche|möchte|medizin|tabletten|bestellen|warenkorb|kasse|ja|nein)\b/i;
 const ARABIC_LATIN_HINTS = /\b(salam|marhaba|shukran|yalla|tamam|aywa)\b/i;
 const HINGLISH_HINTS = /\b(mujhe|chahiye|karo|dena|wala|haan|nahi|kitna|dawai|tablet|pehla|dusra|aur|bhi|hai|ke liye|manga|ruko|band)\b/i;
 const ENGLISH_HINTS = /\b(the|and|please|need|add|medicine|medicines|cart|order|have|want|for|to|my)\b/i;
 
+const SILENCE_THRESHOLD = 0.04;
+const SILENCE_TIMEOUT_MS = 1500;
+
 function normalizeLanguageTag(lang) {
-    if (!lang) return '';
-    const clean = String(lang).replace('_', '-');
-    const [base, region] = clean.split('-');
-    if (!base) return '';
-    return region ? `${base.toLowerCase()}-${region.toUpperCase()}` : base.toLowerCase();
+  if (!lang) return '';
+  const clean = String(lang).replace('_', '-');
+  const [base, region] = clean.split('-');
+  if (!base) return '';
+  return region ? `${base.toLowerCase()}-${region.toUpperCase()}` : base.toLowerCase();
 }
 
 function pickInitialLanguage() {
-    if (typeof navigator === 'undefined') {
-        return PRIORITY_LANGS[0];
-    }
-
-    const browserLangs = [
-        ...(Array.isArray(navigator.languages) ? navigator.languages : []),
-        navigator.language,
-    ]
-        .map(normalizeLanguageTag)
-        .filter(Boolean);
-
-    const supported = [...PRIORITY_LANGS, ...BONUS_LANGS];
-
-    for (const browserLang of browserLangs) {
-        const exact = supported.find(l => l.toLowerCase() === browserLang.toLowerCase());
-        if (exact) return exact;
-
-        const base = browserLang.split('-')[0];
-        const byBase = supported.find(l => l.toLowerCase().startsWith(`${base}-`));
-        if (byBase) return byBase;
-    }
-
-    return PRIORITY_LANGS[0];
+  if (typeof navigator === 'undefined') return PRIORITY_LANGS[0];
+  const browserLangs = [
+    ...(Array.isArray(navigator.languages) ? navigator.languages : []),
+    navigator.language,
+  ]
+    .map(normalizeLanguageTag)
+    .filter(Boolean);
+  const supported = [...PRIORITY_LANGS, ...BONUS_LANGS];
+  for (const browserLang of browserLangs) {
+    const exact = supported.find(l => l.toLowerCase() === browserLang.toLowerCase());
+    if (exact) return exact;
+    const base = browserLang.split('-')[0];
+    const byBase = supported.find(l => l.toLowerCase().startsWith(`${base}-`));
+    if (byBase) return byBase;
+  }
+  return PRIORITY_LANGS[0];
 }
 
-// Ultra-fast script detection ??? checks first 50 chars only for speed
 function detectScript(text) {
-    if (!text || text.length === 0) return LATIN_RESULT;
-
-    const sample = text.length > 50 ? text.slice(0, 50) : text;
-
-    for (let i = 0; i < SCRIPT_PATTERNS.length; i++) {
-        if (SCRIPT_PATTERNS[i].regex.test(sample)) {
-            const { lang, script } = SCRIPT_PATTERNS[i];
-            return { lang, script, direction: script === 'Arabic' ? 'rtl' : 'ltr' };
-        }
+  if (!text || text.length === 0) return LATIN_RESULT;
+  const sample = text.length > 50 ? text.slice(0, 50) : text;
+  for (let i = 0; i < SCRIPT_PATTERNS.length; i++) {
+    if (SCRIPT_PATTERNS[i].regex.test(sample)) {
+      const { lang, script } = SCRIPT_PATTERNS[i];
+      return { lang, script, direction: script === 'Arabic' ? 'rtl' : 'ltr' };
     }
-
-    return LATIN_RESULT;
+  }
+  return LATIN_RESULT;
 }
 
 function detectLanguageFromText(text, fallbackLang) {
-    const scriptDetection = detectScript(text);
-    if (scriptDetection.script !== 'Latin') {
-        return scriptDetection;
-    }
-
-    const sample = (text || '').trim();
-    if (!sample) return { ...LATIN_RESULT, lang: fallbackLang || LATIN_RESULT.lang };
-
-    if (GERMAN_HINTS.test(sample) || /[????????]/i.test(sample)) {
-        return { lang: 'de-DE', script: 'Latin', direction: 'ltr' };
-    }
-
-    if (ARABIC_LATIN_HINTS.test(sample)) {
-        return { lang: 'ar-SA', script: 'Latin', direction: 'rtl' };
-    }
-
-    if (HINGLISH_HINTS.test(sample)) {
-        return { lang: 'hi-IN', script: 'Latin', direction: 'ltr' };
-    }
-
-    if (ENGLISH_HINTS.test(sample)) {
-        return { lang: 'en-US', script: 'Latin', direction: 'ltr' };
-    }
-
-    return { lang: fallbackLang || LATIN_RESULT.lang, script: 'Latin', direction: 'ltr' };
+  const scriptDetection = detectScript(text);
+  if (scriptDetection.script !== 'Latin') return scriptDetection;
+  const sample = (text || '').trim();
+  if (!sample) return { ...LATIN_RESULT, lang: fallbackLang || LATIN_RESULT.lang };
+  if (GERMAN_HINTS.test(sample) || /[äöüß]/i.test(sample)) {
+    return { lang: 'de-DE', script: 'Latin', direction: 'ltr' };
+  }
+  if (ARABIC_LATIN_HINTS.test(sample)) {
+    return { lang: 'ar-SA', script: 'Latin', direction: 'rtl' };
+  }
+  if (HINGLISH_HINTS.test(sample)) {
+    return { lang: 'hi-IN', script: 'Latin', direction: 'ltr' };
+  }
+  if (ENGLISH_HINTS.test(sample)) {
+    return { lang: 'en-US', script: 'Latin', direction: 'ltr' };
+  }
+  return { lang: fallbackLang || LATIN_RESULT.lang, script: 'Latin', direction: 'ltr' };
 }
 
 export function useSpeech() {
-    const initialLanguage = useMemo(() => pickInitialLanguage(), []);
-    const [isListening, setIsListening] = useState(false);
-    const [isSpeaking, setIsSpeaking] = useState(false);
-    const [transcript, setTranscript] = useState('');
-    const [error, setError] = useState(null);
-    const [isSupported, setIsSupported] = useState(true);
-    const [audioLevel, setAudioLevel] = useState(0);
-    const [detectedLanguage, setDetectedLanguage] = useState(initialLanguage);
-    const [scriptInfo, setScriptInfo] = useState({ ...LATIN_RESULT, lang: initialLanguage });
-    const [voices, setVoices] = useState([]);
-    const [selectedVoice, setSelectedVoice] = useState(null);
-    const [manualLanguage, setManualLanguage] = useState(null);
+  const initialLanguage = useMemo(() => pickInitialLanguage(), []);
 
-    const recognitionRef = useRef(null);
-    const synthRef = useRef(null);
-    const audioContextRef = useRef(null);
-    const analyserRef = useRef(null);
-    const animationFrameRef = useRef(null);
-    const streamRef = useRef(null);
-    const lastDetectionRef = useRef({ ...LATIN_RESULT, lang: initialLanguage });
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcript, setTranscript] = useState('');
+  const [error, setError] = useState(null);
+  const [isSupported, setIsSupported] = useState(true);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [detectedLanguage, setDetectedLanguage] = useState(initialLanguage);
+  const [scriptInfo, setScriptInfo] = useState({ ...LATIN_RESULT, lang: initialLanguage });
+  const [voices, setVoices] = useState([]);
+  const [selectedVoice, setSelectedVoice] = useState(null);
+  const [manualLanguage, setManualLanguage] = useState(null);
 
-    // Refs for TTS reliability
-    const ttsWatchdogRef = useRef(null);
-    const ttsHeartbeatRef = useRef(null);
-    const ttsOnEndCallbackRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const streamRef = useRef(null);
 
-    // Ref to hold latest values without triggering re-renders / re-creation
-    const langRef = useRef({ detected: initialLanguage, manual: null, initial: initialLanguage });
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const animationFrameRef = useRef(null);
 
-    // Keep langRef in sync (cheap ??? only ref mutation, no re-render)
-    useEffect(() => {
-        langRef.current = { detected: detectedLanguage, manual: manualLanguage, initial: initialLanguage };
-    }, [detectedLanguage, manualLanguage, initialLanguage]);
+  const audioPlayerRef = useRef(null);
+  const audioOnEndRef = useRef(null);
 
-    // ?????? Audio analysis (mic volume) ?????????????????????????????????????????????????????????????????????????????????????????????
-    const startAudioAnalysis = useCallback(async () => {
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            streamRef.current = stream;
+  const langRef = useRef({ detected: detectedLanguage, manual: null, initial: initialLanguage });
+  const lastDetectionRef = useRef({ ...LATIN_RESULT, lang: initialLanguage });
 
-            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            audioContextRef.current = audioContext;
+  const silenceStartRef = useRef(null);
+  const autoStopVADRef = useRef(false);
 
-            const analyser = audioContext.createAnalyser();
-            analyser.fftSize = 256;
-            analyser.smoothingTimeConstant = 0.8;
-            analyserRef.current = analyser;
+  useEffect(() => {
+    langRef.current = { detected: detectedLanguage, manual: manualLanguage, initial: initialLanguage };
+  }, [detectedLanguage, manualLanguage, initialLanguage]);
 
-            const source = audioContext.createMediaStreamSource(stream);
-            source.connect(analyser);
-
-            const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-            const updateLevel = () => {
-                if (!analyserRef.current) return;
-                analyserRef.current.getByteFrequencyData(dataArray);
-                const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-                const normalized = Math.min(average / 128, 1);
-                setAudioLevel(normalized);
-                animationFrameRef.current = requestAnimationFrame(updateLevel);
-            };
-
-            updateLevel();
-        } catch (err) {
-            console.error('Audio analysis error:', err);
+  useEffect(() => {
+    fetch(`${API_BASE}/voice/voices`)
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(data => {
+        if (data.voices) {
+          setVoices(data.voices);
+          setSelectedVoice(data.voices[0] || null);
         }
-    }, []);
+      })
+      .catch(() => {});
+  }, []);
 
-    const stopAudioAnalysis = useCallback(() => {
-        if (animationFrameRef.current) {
-            cancelAnimationFrame(animationFrameRef.current);
-            animationFrameRef.current = null;
+  const startAudioAnalysis = useCallback((stream) => {
+    if (!stream) return;
+    try {
+      const audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.8;
+      analyserRef.current = analyser;
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const updateLevel = () => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteFrequencyData(dataArray);
+        const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+        const normalized = Math.min(average / 128, 1);
+        setAudioLevel(normalized);
+        if (autoStopVADRef.current && mediaRecorderRef.current?.state === 'recording') {
+          if (normalized < SILENCE_THRESHOLD) {
+            const now = Date.now();
+            if (!silenceStartRef.current) silenceStartRef.current = now;
+            if (now - silenceStartRef.current > SILENCE_TIMEOUT_MS) {
+              silenceStartRef.current = null;
+              try { mediaRecorderRef.current.stop(); } catch (_) {}
+            }
+          } else {
+            silenceStartRef.current = null;
+          }
         }
-        if (audioContextRef.current) {
-            audioContextRef.current.close().catch(() => { });
-            audioContextRef.current = null;
+        animationFrameRef.current = requestAnimationFrame(updateLevel);
+      };
+      updateLevel();
+    } catch (err) {
+      console.error('Audio analysis error:', err);
+    }
+  }, []);
+
+  const stopAudioAnalysis = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+    analyserRef.current = null;
+    setAudioLevel(0);
+    silenceStartRef.current = null;
+  }, []);
+
+  const setPreferredLanguage = useCallback((langCode) => {
+    const normalized = normalizeLanguageTag(langCode) || null;
+    const langToUse = normalized || initialLanguage;
+    const direction = (langToUse || '').toLowerCase().startsWith('ar') ? 'rtl' : 'ltr';
+    setManualLanguage(normalized);
+    setDetectedLanguage(langToUse);
+    const info = { lang: langToUse, script: 'Latin', direction };
+    setScriptInfo(info);
+    lastDetectionRef.current = info;
+  }, [initialLanguage]);
+
+  const setVoice = useCallback((voice) => {
+    setSelectedVoice(voice);
+  }, []);
+
+  const sendAudioForTranscription = useCallback(async (blob) => {
+    setIsTranscribing(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', blob, 'voice.webm');
+      const lang = langRef.current.manual || langRef.current.detected;
+      if (lang) formData.append('language', lang.split('-')[0]);
+
+      const res = await fetch(`${API_BASE}/voice/transcribe`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) throw new Error('Transcription failed');
+      const data = await res.json();
+      const text = (data.text || '').trim();
+      setTranscript(text);
+
+      if (text && data.language && !langRef.current.manual) {
+        const langMap = { en: 'en-US', de: 'de-DE', ar: 'ar-SA', hi: 'hi-IN' };
+        const backendLang = langMap[data.language] || (data.language ? `${data.language}-${data.language.toUpperCase()}` : null);
+        if (backendLang) {
+          const detected = detectLanguageFromText(text, backendLang);
+          lastDetectionRef.current = detected;
+          setScriptInfo(detected);
+          setDetectedLanguage(detected.lang);
         }
-        if (streamRef.current) {
-            streamRef.current.getTracks().forEach(track => track.stop());
+      }
+    } catch (err) {
+      console.error('[STT] transcription error:', err);
+      setError(err.message || 'Transcription failed');
+    } finally {
+      setIsTranscribing(false);
+    }
+  }, []);
+
+  const startListening = useCallback(() => {
+    if (mediaRecorderRef.current?.state === 'recording') return;
+    setTranscript('');
+    setError(null);
+    audioChunksRef.current = [];
+    const langToUse = langRef.current.manual || langRef.current.detected || langRef.current.initial;
+    setScriptInfo(prev => ({
+      ...prev,
+      lang: langToUse,
+      direction: langToUse.toLowerCase().startsWith('ar') ? 'rtl' : 'ltr',
+    }));
+
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then((stream) => {
+        streamRef.current = stream;
+        startAudioAnalysis(stream);
+
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : 'audio/webm';
+        const recorder = new MediaRecorder(stream, { mimeType });
+        audioChunksRef.current = [];
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) audioChunksRef.current.push(e.data);
+        };
+        recorder.onstop = () => {
+          setIsListening(false);
+          const blob = new Blob(audioChunksRef.current, { type: mimeType });
+          audioChunksRef.current = [];
+          if (blob.size > 0) sendAudioForTranscription(blob);
+          if (streamRef.current) {
+            streamRef.current.getTracks().forEach(t => t.stop());
             streamRef.current = null;
-        }
-        analyserRef.current = null;
-        setAudioLevel(0);
-    }, []);
-
-    // ?????? TTS voices ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-    useEffect(() => {
-        if (typeof window === 'undefined') return;
-        const synth = window.speechSynthesis;
-        const loadVoices = () => {
-            const available = synth.getVoices();
-            if (available.length > 0) {
-                setVoices(available);
-                if (!selectedVoice) {
-                    const preferredLang = (
-                        langRef.current.manual
-                        || langRef.current.detected
-                        || langRef.current.initial
-                        || 'en-US'
-                    ).toLowerCase();
-                    const preferredBase = preferredLang.split('-')[0];
-                    const defaultVoice =
-                        available.find(v => v.lang?.toLowerCase() === preferredLang)
-                        || available.find(v => v.lang?.toLowerCase().startsWith(`${preferredBase}-`))
-                        || available.find(v => v.lang?.toLowerCase().startsWith('en-'))
-                        || available[0];
-                    setSelectedVoice(defaultVoice);
-                }
-            }
+          }
         };
-        loadVoices();
-        synth.onvoiceschanged = loadVoices;
-        return () => { synth.onvoiceschanged = null; };
-    }, []);
-
-    const setVoice = useCallback((voice) => {
-        setSelectedVoice(voice);
-    }, []);
-
-    const setPreferredLanguage = useCallback((langCode) => {
-        const normalized = normalizeLanguageTag(langCode) || null;
-        const langToUse = normalized || initialLanguage;
-        const direction = (langToUse || '').toLowerCase().startsWith('ar') ? 'rtl' : 'ltr';
-
-        setManualLanguage(normalized);
-        setDetectedLanguage(langToUse);
-        const info = { lang: langToUse, script: 'Latin', direction };
-        setScriptInfo(info);
-        lastDetectionRef.current = info;
-
-        // Update recognition language *without* re-creating the instance
-        if (recognitionRef.current) {
-            recognitionRef.current.lang = langToUse;
-        }
-    }, [initialLanguage]);
-
-    // ?????? Create SpeechRecognition instance ONCE on mount ?????????????????????????????????
-    useEffect(() => {
-        if (typeof window === 'undefined') return;
-
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SpeechRecognition) {
-            setIsSupported(false);
-            setError('Speech recognition not supported in this browser');
-            return;
-        }
-
-        const recognition = new SpeechRecognition();
-        recognition.continuous = false;
-        recognition.interimResults = true;
-        recognition.maxAlternatives = 1;
-        recognition.lang = langRef.current.manual || langRef.current.detected || langRef.current.initial;
-
-        recognition.onstart = () => {
-            setIsListening(true);
-            setError(null);
-            // Sync language from latest ref
-            const lang = langRef.current.manual || langRef.current.detected || langRef.current.initial;
-            if (recognition.lang !== lang) {
-                recognition.lang = lang;
-            }
+        recorder.onerror = () => {
+          setIsListening(false);
+          setError('Recording error occurred');
         };
-
-        recognition.onresult = (event) => {
-            let finalTranscript = '';
-            let interimTranscript = '';
-
-            for (let i = event.resultIndex; i < event.results.length; i++) {
-                const result = event.results[i];
-                if (result.isFinal) {
-                    finalTranscript += result[0].transcript;
-                } else {
-                    interimTranscript += result[0].transcript;
-                }
-            }
-
-            const currentText = finalTranscript || interimTranscript;
-            setTranscript(currentText);
-
-            // Dynamic language + script detection
-            const currentLang = recognition.lang || langRef.current.manual || langRef.current.detected || langRef.current.initial;
-            const detected = detectLanguageFromText(currentText, currentLang);
-
-            if (langRef.current.manual) {
-                const forced = {
-                    ...detected,
-                    lang: langRef.current.manual,
-                    direction: langRef.current.manual.toLowerCase().startsWith('ar') ? 'rtl' : detected.direction,
-                };
-                lastDetectionRef.current = forced;
-                setScriptInfo(forced);
-                setDetectedLanguage(langRef.current.manual);
-                return;
-            }
-
-            if (
-                detected.script !== lastDetectionRef.current.script ||
-                detected.lang !== lastDetectionRef.current.lang ||
-                detected.direction !== lastDetectionRef.current.direction
-            ) {
-                lastDetectionRef.current = detected;
-                setScriptInfo(detected);
-                setDetectedLanguage(detected.lang);
-                // Update recognizer for the *next* session (harmless mid-session)
-                recognition.lang = detected.lang;
-            }
-        };
-
-        recognition.onerror = (event) => {
-            console.warn('[STT] recognition error:', event.error);
-            setIsListening(false);
-            if (event.error === 'not-allowed') {
-                setError('Microphone access denied. Please allow microphone access.');
-            } else if (event.error === 'no-speech') {
-                // User was silent ??? not a real error
-                setError(null);
-            } else if (event.error !== 'aborted') {
-                setError(`Speech recognition error: ${event.error}`);
-            }
-        };
-
-        recognition.onend = () => {
-            setIsListening(false);
-        };
-
-        recognitionRef.current = recognition;
-        synthRef.current = window.speechSynthesis;
-
-        return () => {
-            try { recognition.abort(); } catch (_) { }
-            stopAudioAnalysis();
-        };
-        // Only run ONCE on mount ??? language changes handled via langRef
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
-
-    // ?????? TTS helper: clear watchdog/heartbeat ??????????????????????????????????????????????????????????????????
-    const clearTTSTimers = useCallback(() => {
-        if (ttsWatchdogRef.current) { clearTimeout(ttsWatchdogRef.current); ttsWatchdogRef.current = null; }
-        if (ttsHeartbeatRef.current) { clearInterval(ttsHeartbeatRef.current); ttsHeartbeatRef.current = null; }
-        ttsOnEndCallbackRef.current = null;
-    }, []);
-
-    // ?????? Start listening ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-    const startListening = useCallback(() => {
-        if (!recognitionRef.current) return;
-
-        setTranscript('');
-        setError(null);
-        const langToUse = langRef.current.manual || langRef.current.detected || langRef.current.initial;
-
-        setScriptInfo(prev => ({ ...prev, lang: langToUse, direction: langToUse.toLowerCase().startsWith('ar') ? 'rtl' : 'ltr' }));
-
-        if (recognitionRef.current.lang !== langToUse) {
-            recognitionRef.current.lang = langToUse;
-        }
-
-        startAudioAnalysis();
-
-        try {
-            recognitionRef.current.start();
-        } catch (err) {
-            if (err.name === 'InvalidStateError') {
-                // Already running or not finished stopping ??? abort then retry
-                try {
-                    recognitionRef.current.abort();
-                } catch (_) { }
-                setTimeout(() => {
-                    try { recognitionRef.current.start(); } catch (_) { }
-                }, 150);
-            } else {
-                setError(err.message);
-            }
-        }
-    }, [startAudioAnalysis]);
-
-    // ?????? Stop listening ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-    const stopListening = useCallback(() => {
-        if (!recognitionRef.current) return;
+        recorder.start(100);
+        mediaRecorderRef.current = recorder;
+        setIsListening(true);
+      })
+      .catch(() => {
+        setError('Microphone access denied');
+        setIsSupported(false);
         stopAudioAnalysis();
-        try { recognitionRef.current.stop(); } catch (_) { }
-    }, [stopAudioAnalysis]);
+      });
+  }, [startAudioAnalysis, sendAudioForTranscription]);
 
-    // ?????? Toggle listening ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-    const toggleListening = useCallback(() => {
-        if (isListening) { stopListening(); } else { startListening(); }
-    }, [isListening, startListening, stopListening]);
+  const stopListening = useCallback(() => {
+    autoStopVADRef.current = false;
+    silenceStartRef.current = null;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    } else {
+      setIsListening(false);
+      stopAudioAnalysis();
+    }
+  }, [stopAudioAnalysis]);
 
-    // ?????? Speak (TTS) with watchdog + Chrome heartbeat ???????????????????????????????????????
-    const speak = useCallback((text, options = {}) => {
-        if (!synthRef.current || !text) {
-            // If no text, immediately fire onEnd so voice loop doesn't stall
-            if (options.onEnd) setTimeout(() => options.onEnd(), 50);
-            return;
-        }
+  const toggleListening = useCallback(() => {
+    if (mediaRecorderRef.current?.state === 'recording') {
+      stopListening();
+    } else {
+      startListening();
+    }
+  }, [startListening, stopListening]);
 
-        // Cancel any in-progress speech and timers
-        synthRef.current.cancel();
-        clearTTSTimers();
+  const speak = useCallback((text, options = {}) => {
+    if (!text) {
+      if (options.onEnd) setTimeout(() => options.onEnd(), 50);
+      return;
+    }
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+      audioPlayerRef.current = null;
+    }
+    setIsSpeaking(true);
 
-        const utterance = new SpeechSynthesisUtterance(text);
-        const lang = options.lang || langRef.current.detected || langRef.current.initial;
-        utterance.lang = lang;
-        utterance.rate = options.rate || 1.0;
-        utterance.pitch = options.pitch || 1.0;
-        utterance.volume = options.volume || 1.0;
+    const lang = options.lang || langRef.current.detected || langRef.current.initial;
+    audioOnEndRef.current = options.onEnd || null;
 
-        // Voice selection
-        const availableVoices = synthRef.current.getVoices();
-        const targetLang = String(lang || '').toLowerCase();
-        const targetBase = targetLang.split('-')[0];
-        const exactVoice = availableVoices.find(v => v.lang?.toLowerCase() === targetLang);
-        const prefixVoice = availableVoices.find(v => v.lang?.toLowerCase().startsWith(`${targetBase}-`));
-        const englishVoice = availableVoices.find(v =>
-            v.lang?.toLowerCase() === 'en-in' || v.lang?.toLowerCase() === 'en_in'
-        ) || availableVoices.find(v => v.lang?.toLowerCase().startsWith('en-'));
+    const params = new URLSearchParams();
+    params.set('text', text);
+    params.set('language', lang);
+    if (options.rate && options.rate !== 1.0) {
+      const diff = Math.round((options.rate - 1) * 100);
+      params.set('rate', `${diff >= 0 ? '+' : ''}${diff}%`);
+    }
 
-        // Voice selection logic:
-        // Prioritize selectedVoice IF its language matches the target language's base.
-        // Otherwise, prioritize an exact/prefix match for the target language to prevent US voices speaking Hindi.
-        const isSelectedVoiceMatch = selectedVoice && selectedVoice.lang && selectedVoice.lang.toLowerCase().startsWith(`${targetBase}-`);
+    const url = `${API_BASE}/voice/tts?${params.toString()}`;
 
-        utterance.voice =
-            (isSelectedVoiceMatch ? selectedVoice : null)
-            || exactVoice
-            || prefixVoice
-            || selectedVoice
-            || englishVoice
-            || availableVoices[0]
-            || null;
-
-        // Track the onEnd callback so the watchdog can fire it
-        ttsOnEndCallbackRef.current = options.onEnd || null;
-        let ended = false;
-
-        const handleEnd = () => {
-            if (ended) return;
-            ended = true;
-            setIsSpeaking(false);
-            clearTTSTimers();
-            if (options.onEnd) options.onEnd();
-        };
-
-        utterance.onstart = () => setIsSpeaking(true);
-        utterance.onend = handleEnd;
-        utterance.onerror = (e) => {
-            console.warn('[TTS] utterance error:', e?.error || e);
-            handleEnd();
-        };
-
-        // Chrome heartbeat: speechSynthesis can freeze if we don't poke it
-        ttsHeartbeatRef.current = setInterval(() => {
-            if (synthRef.current && synthRef.current.speaking) {
-                synthRef.current.pause();
-                synthRef.current.resume();
-            }
-        }, TTS_HEARTBEAT_MS);
-
-        // Watchdog: forcibly end after max duration so voice loop never stalls
-        ttsWatchdogRef.current = setTimeout(() => {
-            console.warn('[TTS] Watchdog fired ??? utterance exceeded max duration, force-ending.');
-            try { synthRef.current?.cancel(); } catch (_) { }
-            handleEnd();
-        }, TTS_MAX_DURATION_MS);
-
-        synthRef.current.speak(utterance);
-    }, [selectedVoice, clearTTSTimers]);
-
-    // ?????? Stop speaking ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-    const stopSpeaking = useCallback(() => {
-        if (!synthRef.current) return;
-        synthRef.current.cancel();
-        clearTTSTimers();
-        setIsSpeaking(false);
-    }, [clearTTSTimers]);
-
-    // Cleanup on unmount
-    useEffect(() => {
-        return () => {
-            clearTTSTimers();
-            stopAudioAnalysis();
-        };
-    }, [clearTTSTimers, stopAudioAnalysis]);
-
-    return {
-        isListening,
-        isSpeaking,
-        transcript,
-        error,
-        isSupported,
-        audioLevel,
-        detectedLanguage,
-        scriptInfo,
-        manualLanguage,
-        voices,
-        selectedVoice,
-        setVoice,
-        setPreferredLanguage,
-        startListening,
-        stopListening,
-        toggleListening,
-        speak,
-        stopSpeaking,
-        setTranscript,
+    const handleEnd = () => {
+      setIsSpeaking(false);
+      audioPlayerRef.current = null;
+      if (audioOnEndRef.current) {
+        const cb = audioOnEndRef.current;
+        audioOnEndRef.current = null;
+        cb();
+      }
     };
+
+    fetch(url)
+      .then(res => {
+        if (!res.ok) throw new Error('TTS request failed');
+        return res.blob();
+      })
+      .then(blob => {
+        const objectUrl = URL.createObjectURL(blob);
+        const audio = new Audio(objectUrl);
+        audioPlayerRef.current = audio;
+        audio.onended = () => {
+          URL.revokeObjectURL(objectUrl);
+          handleEnd();
+        };
+        audio.onerror = () => {
+          URL.revokeObjectURL(objectUrl);
+          handleEnd();
+        };
+        return audio.play();
+      })
+      .catch(() => {
+        handleEnd();
+      });
+  }, []);
+
+  const stopSpeaking = useCallback(() => {
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+      audioPlayerRef.current = null;
+    }
+    setIsSpeaking(false);
+    audioOnEndRef.current = null;
+  }, []);
+
+  const enableVAD = useCallback(() => {
+    autoStopVADRef.current = true;
+  }, []);
+
+  const disableVAD = useCallback(() => {
+    autoStopVADRef.current = false;
+    silenceStartRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (mediaRecorderRef.current?.state === 'recording') {
+        try { mediaRecorderRef.current.stop(); } catch (_) {}
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop());
+      }
+      if (audioPlayerRef.current) {
+        audioPlayerRef.current.pause();
+      }
+      stopAudioAnalysis();
+    };
+  }, [stopAudioAnalysis]);
+
+  return {
+    isListening,
+    isSpeaking,
+    isTranscribing,
+    transcript,
+    error,
+    isSupported,
+    audioLevel,
+    detectedLanguage,
+    scriptInfo,
+    manualLanguage,
+    voices,
+    selectedVoice,
+    setVoice,
+    setPreferredLanguage,
+    startListening,
+    stopListening,
+    toggleListening,
+    speak,
+    stopSpeaking,
+    setTranscript,
+    enableVAD,
+    disableVAD,
+  };
 }
