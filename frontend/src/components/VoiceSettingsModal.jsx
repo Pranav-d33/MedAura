@@ -1,10 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useLanguage } from '../i18n/LanguageContext';
+
+const API_BASE = '/api';
 
 export default function VoiceSettingsModal({ isOpen, onClose, voices, currentVoice, onVoiceChange, isVoiceMode }) {
     const { t } = useLanguage();
     const [previewText, setPreviewText] = useState(t('voicePreviewDefault'));
     const [isPlaying, setIsPlaying] = useState(false);
+    const previewAudioRef = useRef(null);
 
     useEffect(() => {
         setPreviewText(t('voicePreviewDefault'));
@@ -12,34 +15,42 @@ export default function VoiceSettingsModal({ isOpen, onClose, voices, currentVoi
 
     if (!isOpen) return null;
 
-    const handlePreview = (voice) => {
+    const handlePreview = async (voice) => {
         if (!voice) return;
-        window.speechSynthesis.cancel();
-        const utterance = new SpeechSynthesisUtterance(previewText);
-        utterance.voice = voice;
-        utterance.rate = 1.0;
-        utterance.pitch = 1.0;
-
-        utterance.onstart = () => setIsPlaying(true);
-        utterance.onend = () => setIsPlaying(false);
-        utterance.onerror = () => setIsPlaying(false);
-
-        window.speechSynthesis.speak(utterance);
+        if (previewAudioRef.current) {
+            previewAudioRef.current.pause();
+            previewAudioRef.current = null;
+        }
+        setIsPlaying(true);
+        try {
+            const params = new URLSearchParams();
+            params.set('text', previewText);
+            params.set('voice', voice.name);
+            const res = await fetch(`${API_BASE}/voice/tts?${params.toString()}`);
+            if (!res.ok) throw new Error();
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            previewAudioRef.current = audio;
+            audio.onended = () => {
+                setIsPlaying(false);
+                URL.revokeObjectURL(url);
+                previewAudioRef.current = null;
+            };
+            audio.onerror = () => {
+                setIsPlaying(false);
+                URL.revokeObjectURL(url);
+                previewAudioRef.current = null;
+            };
+            await audio.play();
+        } catch {
+            setIsPlaying(false);
+        }
     };
 
     // Group voices by language for better UX
     const groupedVoices = voices.reduce((acc, voice) => {
-        let langCode = voice.lang || '';
-        if (!langCode) {
-            if (voice.name.toLowerCase().includes('english') && voice.name.toLowerCase().includes('india')) {
-                langCode = 'en-US';
-            } else if (voice.name.toLowerCase().includes('english')) {
-                langCode = 'en-US';
-            } else {
-                langCode = 'unknown';
-            }
-        }
-        langCode = langCode.replace('_', '-');
+        const langCode = (voice.lang || voice.locale || 'unknown').replace('_', '-');
         const langGroup = langCode.toUpperCase();
 
         if (!acc[langGroup]) acc[langGroup] = [];
@@ -128,8 +139,8 @@ export default function VoiceSettingsModal({ isOpen, onClose, voices, currentVoi
                                                                 {voice.name}
                                                             </div>
                                                             <div className="text-xs text-gray-400 truncate">
-                                                                {voice.lang} {voice.localService ? `(${t('local')})` : `(${t('online')})`}
-                                                            </div>
+                                                                 {voice.locale || voice.lang}
+                                                             </div>
                                                         </div>
 
                                                         <div className="flex items-center gap-2">
