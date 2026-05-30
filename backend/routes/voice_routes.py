@@ -1,10 +1,3 @@
-"""
-New voice pipeline routes:
-  POST /api/voice/process  — audio -> Groq STT -> agent -> Edge-TTS (single round-trip)
-  GET  /api/voice/tts      — text -> Edge-TTS audio stream
-  GET  /api/voice/voices   — list available Edge-TTS voices
-  GET  /api/voice/transcribe — existing, kept for backward compat
-"""
 from __future__ import annotations
 
 from typing import Optional
@@ -25,13 +18,14 @@ async def tts(
     voice: Optional[str] = Query(None, max_length=100),
     rate: str = Query("+0%", max_length=10),
 ):
-    """Text-to-Speech: returns MP3 audio bytes from Edge-TTS."""
     audio = await text_to_speech(
         text=text,
         language=language,
         voice=voice,
         rate=rate,
     )
+    if not audio:
+        raise HTTPException(status_code=503, detail="TTS synthesis failed")
     return Response(
         content=audio,
         media_type="audio/mpeg",
@@ -44,8 +38,7 @@ async def tts(
 
 @router.get("/voices")
 async def voices():
-    """List available Edge-TTS voices."""
-    return {"voices": await list_voices()}
+    return list_voices()
 
 
 @router.post("/transcribe")
@@ -53,5 +46,4 @@ async def transcribe(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
 ):
-    """Transcribe audio using Groq Whisper (backward-compat)."""
     return await transcribe_audio_file(file, language=language)

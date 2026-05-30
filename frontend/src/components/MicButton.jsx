@@ -3,7 +3,7 @@
  */
 import React from 'react';
 
-export default function MicButton({ isListening, onClick, disabled }) {
+export default function MicButton({ isListening, isTranscribing, onClick, disabled }) {
     return (
         <button
             onClick={onClick}
@@ -13,12 +13,14 @@ export default function MicButton({ isListening, onClick, disabled }) {
                 transition-all duration-300 ease-out focus:outline-none focus:ring-2 focus:ring-mediloon-300 focus:ring-offset-2
                 ${isListening
                     ? 'bg-gradient-to-br from-mediloon-500 to-mediloon-700 text-white shadow-glow-red scale-[1.02]'
+                    : isTranscribing
+                    ? 'bg-gradient-to-br from-amber-400 to-amber-600 text-white shadow-glow-sm scale-[1.02]'
                     : 'bg-white text-mediloon-500 border-2 border-surface-fog hover:border-mediloon-300 hover:shadow-glow-red-sm hover:bg-mediloon-50/50'
                 }
                 ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer active:scale-[0.95]'}
             `}
-            aria-label={isListening ? 'Exit Voice Mode' : 'Enter Voice Mode'}
-            title={isListening ? 'Voice Mode Active — click to exit' : 'Enter Voice Mode'}
+            aria-label={isListening ? 'Exit Voice Mode' : isTranscribing ? 'Transcribing...' : 'Enter Voice Mode'}
+            title={isListening ? 'Voice Mode Active — click to exit' : isTranscribing ? 'Processing speech...' : 'Enter Voice Mode'}
         >
             {/* Pulse rings when listening */}
             {isListening && (
@@ -28,10 +30,15 @@ export default function MicButton({ isListening, onClick, disabled }) {
                 </>
             )}
 
+            {/* Spinner when transcribing */}
+            {isTranscribing && (
+                <span className="absolute inset-1 rounded-2xl border-2 border-amber-300/40 border-t-transparent animate-spin" />
+            )}
+
             {/* Mic Icon */}
             <svg
                 xmlns="http://www.w3.org/2000/svg"
-                className={`w-5 h-5 relative z-10 transition-all duration-300 ${isListening ? 'text-white scale-110' : 'group-hover:text-mediloon-600 group-hover:scale-110'}`}
+                className={`w-5 h-5 relative z-10 transition-all duration-300 ${isListening || isTranscribing ? 'text-white scale-110' : 'group-hover:text-mediloon-600 group-hover:scale-110'}`}
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
@@ -49,6 +56,13 @@ export default function MicButton({ isListening, onClick, disabled }) {
             {isListening && (
                 <div className="absolute -top-1 -right-1 flex items-center justify-center z-20">
                     <span className="w-3 h-3 bg-white rounded-full shadow-lg border-2 border-mediloon-500 animate-pulse" />
+                </div>
+            )}
+
+            {/* Transcribing indicator */}
+            {isTranscribing && !isListening && (
+                <div className="absolute -top-1 -right-1 flex items-center justify-center z-20">
+                    <span className="w-3 h-3 bg-amber-400 rounded-full shadow-lg border-2 border-amber-600 animate-pulse" />
                 </div>
             )}
         </button>
