@@ -28,12 +28,22 @@ SEED_DB_SOURCE = BASE_DIR / "data" / "mediloon.db"
 
 # ── Groq Configuration (PRIMARY — fast, generous free tier) ─────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEY2 = os.getenv("GROQ_API_KEY2", "")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 # Primary model on Groq: fast 70B
 GROQ_PRIMARY_MODEL = os.getenv("GROQ_PRIMARY_MODEL", "llama-3.3-70b-versatile")
 # Groq fallback: ultra-fast 8B
 GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+
+# Round-robin Groq keys: tries primary first, falls back to secondary on 429
+GROQ_KEYS = [k for k in [GROQ_API_KEY, GROQ_API_KEY2] if k]
+
+def get_groq_key() -> str:
+    return GROQ_KEYS[0] if GROQ_KEYS else ""
+
+def get_groq_fallback_key() -> str:
+    return GROQ_KEYS[1] if len(GROQ_KEYS) > 1 else GROQ_KEYS[0] if GROQ_KEYS else ""
 
 # ── OpenRouter Configuration (SECONDARY — fallback when Groq is down) ─
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")

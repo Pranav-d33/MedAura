@@ -8,12 +8,13 @@ from typing import Optional, Dict, Any
 import httpx
 from fastapi import HTTPException, UploadFile
 
-from config import GROQ_API_KEY, GROQ_BASE_URL, GROQ_STT_MODEL
+from config import GROQ_BASE_URL, GROQ_STT_MODEL, get_groq_key, get_groq_fallback_key
 
 
 async def transcribe_audio_file(file: UploadFile, language: Optional[str] = None) -> Dict[str, Any]:
     """Transcribe an uploaded audio file using Groq Whisper."""
-    if not GROQ_API_KEY:
+    primary_key = get_groq_key()
+    if not primary_key:
         raise HTTPException(status_code=503, detail="Speech transcription is not configured")
 
     audio_bytes = await file.read()
@@ -41,10 +42,20 @@ async def transcribe_audio_file(file: UploadFile, language: Optional[str] = None
         async with httpx.AsyncClient(timeout=45.0) as client:
             response = await client.post(
                 f"{GROQ_BASE_URL}/audio/transcriptions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                headers={"Authorization": f"Bearer {primary_key}"},
                 data=payload,
                 files=files,
             )
+        if response.status_code == 429:
+            fallback_key = get_groq_fallback_key()
+            if fallback_key and fallback_key != primary_key:
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    response = await client.post(
+                        f"{GROQ_BASE_URL}/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {fallback_key}"},
+                        data=payload,
+                        files=files,
+                    )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text.strip() or "Speech transcription failed"
